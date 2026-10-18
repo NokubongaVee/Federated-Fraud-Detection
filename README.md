@@ -2,11 +2,54 @@
 
 A Python research project investigating collaborative financial fraud detection with **Federated Learning (FedAvg)** and **SHAP explainability**. Three simulated banks train a shared neural network while retaining separate training partitions. Local and centralised baselines provide comparisons on chronologically later transactions.
 
+**PaySim · PyTorch · Three simulated banks · Five FedAvg rounds · SHAP**
+
+| Fraud recall | PR-AUC (average precision) | Precision | False positives |
+| :---: | :---: | :---: | :---: |
+| **99.15%** | **66.30%** | **5.44%** | **73,435** |
+
+*Headline results are the notebook's saved outputs at threshold 0.5. High recall comes with substantial false alarms; see result provenance below.*
+
+[Architecture](#system-architecture) · [Dataset](#dataset-and-experimental-design) · [Preprocessing](#preprocessing-and-nine-final-model-inputs) · [Training](#models-and-federated-training) · [Results](#evaluation-and-main-results) · [Installation](#installation) · [Limitations](#limitations-and-academic-disclaimer)
+
 ## Aim and motivation
 
 Financial fraud is rare, making accuracy alone an unreliable measure of detection performance. Financial institutions may also face restrictions on sharing transaction records. This project explores whether collaborative model training can improve detection while preserving data locality, and uses feature attribution to make selected model predictions easier to inspect.
 
 The objectives are to build a consistent preprocessing pipeline, simulate heterogeneous bank datasets, compare local, centralised and federated MLPs, measure performance under severe class imbalance, and explain selected federated predictions.
+
+## System architecture
+
+```mermaid
+flowchart TD
+    D["PaySim: 6,362,620 synthetic transactions"] --> Q["Data-quality checks and chronological split"]
+    Q --> T["Training: steps 1-354"]
+    Q --> H["Held-out test: steps 355-743"]
+    T --> N["Class-dependent Non-IID allocation"]
+    N --> A["Simulated Bank A: local preprocessing + MLP"]
+    N --> B["Simulated Bank B: local preprocessing + MLP"]
+    N --> C["Simulated Bank C: local preprocessing + MLP"]
+    A -->|Parameters + sample count| F["Coordinator: weighted FedAvg"]
+    B -->|Parameters + sample count| F
+    C -->|Parameters + sample count| F
+    F --> G["Global MLP after 5 rounds"]
+    T -.-> POOL["Pooled training representation"]
+    POOL --> P["Separate centralised baseline"]
+    A -.-> L["Independent local baselines"]
+    B -.-> L
+    C -.-> L
+    H --> X["Shared preprocessing: 9 inputs"]
+    X --> E["Common evaluation: 5 models, threshold 0.5"]
+    G --> E
+    P --> E
+    L --> E
+    G --> S["SHAP: selected test predictions"]
+    X --> S
+    POOL -.-> BG["20 pooled training examples as SHAP background"]
+    BG -.-> S
+```
+
+**Implementation boundary:** this is a Jupyter/PyTorch simulation in one process. The coordinator aggregates model parameters; the centralised baseline and pooled SHAP background are separate research procedures. The bidirectional training exchange is detailed in the workflow below.
 
 ## Dataset and experimental design
 
@@ -47,11 +90,14 @@ Every training record belongs to exactly one bank. No test records are allocated
 
 The target is `isFraud`. Five original features are selected: `step`, `type`, `amount`, `oldbalanceOrg`, and `oldbalanceDest`.
 
-- Exclude account identifiers `nameOrig` and `nameDest`, and the existing `isFlaggedFraud` flag.
-- Exclude post-transaction balances `newbalanceOrig` and `newbalanceDest` to avoid potential leakage for prediction before transaction completion.
-- Validate numerical inputs, then apply `log1p` independently to the four numerical columns. Shared scaling statistics are not required.
-- One-hot encode transaction type using a fixed category list and identical feature ordering for every bank.
-- Convert features and labels to NumPy `float32` for PyTorch.
+| Step | Operation | Purpose |
+| --- | --- | --- |
+| 1. Inspect | Check missing values, duplicates, class balance and time ordering | Establish data quality and split validity |
+| 2. Select | Retain four numeric columns and transaction `type`; target is `isFraud` | Define a shared prediction task |
+| 3. Exclude | Remove `nameOrig`, `nameDest`, `isFlaggedFraud`, `newbalanceOrig`, `newbalanceDest` | Avoid identifiers, existing flags and potential post-transaction leakage |
+| 4. Transform | Apply `log1p(x)` to `step`, `amount`, `oldbalanceOrg`, `oldbalanceDest` after validation | Reduce skew and handle zero without fitted shared scaling statistics |
+| 5. Encode | One-hot encode five fixed transaction types; reindex to a shared column order | Align all banks to the same nine inputs |
+| 6. Convert | Produce `float32` features and labels; assert finite values and valid shapes | Prepare consistent PyTorch inputs |
 
 The **nine inputs**, in order, are:
 
@@ -62,17 +108,90 @@ type_CASH_IN, type_CASH_OUT, type_DEBIT, type_PAYMENT, type_TRANSFER
 
 ## Models and federated training
 
-All models use a PyTorch MLP with **9 → 16 → 8 → 1** units, ReLU activations after each hidden layer, and **305 trainable parameters**. The output is a logit; evaluation applies sigmoid and a **0.5 classification threshold**.
+### Shared MLP: 9 → 16 → 8 → 1
 
-Training uses **weighted binary classification loss**, `BCEWithLogitsLoss`, with `pos_weight = legitimate_count / fraud_count`. Each bank calculates its own class weight; the centralised model uses the pooled training distribution. Adam uses learning rate 0.001 and batch size 1,024.
+```mermaid
+flowchart LR
+    X["9 transformed inputs"] --> H1["Linear 9 → 16"]
+    H1 --> R1["ReLU"]
+    R1 --> H2["Linear 16 → 8"]
+    H2 --> R2["ReLU"]
+    R2 --> Z["Linear 8 → 1: logit z"]
+    Z --> P["Sigmoid: fraud score"]
+    P --> Y["Score >= 0.5: flag as fraud"]
+```
 
-| Approach | Training procedure |
+| Layer | Output width | Trainable parameters |
+| --- | ---: | ---: |
+| Linear + ReLU | 16 | 9 × 16 + 16 = 160 |
+| Linear + ReLU | 8 | 16 × 8 + 8 = 136 |
+| Linear output | 1 | 8 × 1 + 1 = 9 |
+| **Total** | | **305** |
+
+Sigmoid is used for evaluation; training passes raw logits to `BCEWithLogitsLoss`.
+
+### Weighted loss and training configuration
+
+For a label $y$ and sigmoid output $p$, the per-example weighted binary cross-entropy is:
+
+$$
+\ell(y,p) = -\left[w_+ y\log(p) + (1-y)\log(1-p)\right],
+\qquad w_+ = \frac{N_{\mathrm{legitimate}}}{N_{\mathrm{fraud}}}
+$$
+
+Each bank calculates its own positive-class weight; the centralised baseline uses the pooled training distribution.
+
+| Setting | Value |
 | --- | --- |
-| Local baselines | Three independent MLPs, each trained for two epochs on one bank's partition |
-| Centralised baseline | One MLP trained for two epochs on the combined training partitions |
-| Federated model | Five FedAvg communication rounds, with two local epochs per bank per round |
+| Optimiser | Adam, learning rate **0.001** |
+| Batch size | **1,024** |
+| Loss | `BCEWithLogitsLoss(pos_weight=...)` |
+| Local class weights | A: **3,201.73** · B: **1,281.23** · C: **512.15** |
+| Local baselines | Three independent MLPs, **2 epochs** per bank |
+| Centralised baseline | One MLP on pooled training partitions, **2 epochs** |
+| Federated model | **5 rounds × 2 local epochs** at each of three banks |
+| Prediction threshold | **0.5** after sigmoid |
 
-Each federated round distributes the current global model to all three banks, trains independent local copies, and aggregates their parameters weighted by local sample count. The approximate aggregation weights are 49.98%, 30.00%, and 20.02%. The aggregation function receives parameters and sample counts rather than raw records. A known-value assertion checks FedAvg's weighted-average calculation.
+### Federated-learning workflow
+
+```mermaid
+sequenceDiagram
+    participant S as Coordinator
+    participant A as Simulated Bank A
+    participant B as Simulated Bank B
+    participant C as Simulated Bank C
+    Note over S,C: Initialise shared architecture and global weights (seed 42)
+    loop Five communication rounds
+        S->>A: Copy current global parameters
+        S->>B: Copy current global parameters
+        S->>C: Copy current global parameters
+        Note over A,C: Each bank trains on its own records for 2 epochs
+        A-->>S: Updated parameters + sample count n_A
+        B-->>S: Updated parameters + sample count n_B
+        C-->>S: Updated parameters + sample count n_C
+        Note over S: Weighted FedAvg updates the global model
+    end
+    Note over S,C: Evaluate final global model on the held-out test set
+```
+
+All banks participate in every round. The implementation trains the clients sequentially in one process; the diagram represents their logical roles. Each client receives a fresh model copy and uses a newly created Adam optimiser for its local training call. Raw records are not passed to the aggregation function.
+
+### FedAvg computation
+
+Let $\theta_k^{(t+1)}$ be bank $k$'s parameters after local training from global parameters $\theta^{(t)}$, and $n_k$ its training sample count. For each parameter tensor:
+
+$$
+\theta^{(t+1)} = \sum_{k \in \{A,B,C\}} \frac{n_k}{N}\theta_k^{(t+1)},
+\qquad N = \sum_k n_k = 5{,}069{,}097
+$$
+
+| Client | Training records $n_k$ | Aggregation weight $n_k/N$ |
+| --- | ---: | ---: |
+| Bank A | 2,533,362 | 49.98% |
+| Bank B | 1,520,728 | 30.00% |
+| Bank C | 1,015,007 | 20.02% |
+
+**Implementation check:** the notebook verifies that values 2 and 4 with sample counts 100 and 300 aggregate to `(100 × 2 + 300 × 4) / 400 = 3.5`. Aggregation weights depend on dataset size; positive-class loss weights address imbalance within each client's training objective.
 
 ### Data locality and privacy scope
 
@@ -90,6 +209,21 @@ This small explanation sample supports inspection of individual predictions; it 
 
 All five models are evaluated on the same held-out test set using **Accuracy, Precision, Recall, F1, ROC-AUC and PR-AUC**. The notebook labels scikit-learn's `average_precision_score` as PR-AUC; it is average precision rather than a trapezoidal PR-curve integral.
 
+### Metric definitions
+
+| Metric | Computation / interpretation | Relevance to rare fraud |
+| --- | --- | --- |
+| Accuracy | `(TP + TN) / (TP + TN + FP + FN)` | Can be dominated by legitimate transactions |
+| Precision | `TP / (TP + FP)` | Fraction of flagged transactions that are actually fraud |
+| Recall | `TP / (TP + FN)` | Fraction of actual fraud detected |
+| F1 | `2 × precision × recall / (precision + recall)` | Balances detection and false-alarm burden |
+| ROC-AUC | Area under the true-positive-rate versus false-positive-rate curve | Measures ranking across score thresholds |
+| PR-AUC (AP) | `average_precision_score(labels, scores)` | Summarises precision across recall increments |
+
+`TP` = true positive, `TN` = true negative, `FP` = false positive, `FN` = false negative. ROC-AUC and average precision use scores; accuracy, precision, recall and F1 use thresholded predictions.
+
+### Comparison on the held-out test set
+
 The following are the **saved notebook results** (percentages, rounded):
 
 | Model | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC |
@@ -102,7 +236,19 @@ The following are the **saved notebook results** (percentages, rounded):
 
 The main reported federated result is **Recall 99.15%, PR-AUC 66.30%, Precision 5.44%**. Its saved confusion matrix contains 4,222 true positives, 36 false negatives, **73,435 false positives**, and 1,215,830 true negatives. High recall comes with many false alarms: approximately 94.56% of flagged transactions are legitimate. Bank A has the highest saved F1 score, while the federated model has the highest saved recall and PR-AUC.
 
+| Actual / predicted | Predicted legitimate | Predicted fraud |
+| --- | ---: | ---: |
+| Actual legitimate | TN = **1,215,830** | FP = **73,435** |
+| Actual fraud | FN = **36** | TP = **4,222** |
+
+> **Operational implication:** high recall alone is insufficient for automatic fraud blocking. At this threshold, false alarms dominate the flagged set; threshold tuning and operational validation remain necessary.
+
+<details>
+<summary><strong>Result provenance: notebook and CSV disagree on the federated run</strong></summary>
+
 **Result provenance:** [models/evaluation_results.csv](models/evaluation_results.csv) contains a different federated row: accuracy 93.97%, precision 5.15%, recall 99.32%, F1 9.79%, ROC-AUC 99.28%, and PR-AUC 58.70%. Its four baseline rows agree with the notebook. Both original artifacts are retained unchanged; the available files do not establish why the federated results differ or which run produced the checkpoints. The headline figures above are specifically the notebook's saved outputs, not a newly reproduced result.
+
+</details>
 
 ## Project structure
 
@@ -140,9 +286,11 @@ Python, Jupyter Notebook, NumPy, pandas, Matplotlib, scikit-learn, PyTorch, SHAP
 
 ## Installation
 
-Clone the repository and enter its directory. Create a virtual environment with Python 3.12:
+Clone the repository and create a virtual environment with Python 3.12:
 
 ```powershell
+git clone https://github.com/NokubongaVee/Federated-Fraud-Detection.git
+cd Federated-Fraud-Detection
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
