@@ -1,0 +1,71 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+*.egg-info/
+
+# Jupyter and IDE state
+.ipynb_checkpoints/
+.ipython/
+.jupyter/
+.vscode/
+.idea/
+.vs/
+.qodo/
+*.code-workspace
+
+# Credentials, environment secrets, and local configuration
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+.aws/
+.ssh/
+.netrc
+.pypirc
+
+# Dataset downloads and derived transaction records (obtain separately)
+/data/**
+!/data/raw/
+!/data/raw/README.md
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Temporary files, logs, OS files, and build output
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+*~
+~$*
+.DS_Store
+Thumbs.db
+Desktop.ini
+node_modules/
+build/
+dist/
+.cache/
+coverage/
+
+# Small research model checkpoints, evaluation CSVs, reports, and figures
+# are intentionally retained. Review new artifacts before committing.
